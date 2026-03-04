@@ -1,0 +1,97 @@
+name: Reusable site deploy
+
+on:
+  workflow_call:
+    inputs:
+      deploy_host:
+        required: false
+        type: string
+        default: "167.235.54.105"
+      deploy_port:
+        required: false
+        type: string
+        default: "22"
+      deploy_user:
+        required: false
+        type: string
+        default: "root"
+      deploy_path:
+        required: true
+        type: string
+      deploy_source:
+        required: false
+        type: string
+        default: "."
+      node_version:
+        required: false
+        type: string
+        default: ""
+      setup_command:
+        required: false
+        type: string
+        default: ""
+      install_command:
+        required: false
+        type: string
+        default: ""
+      build_command:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      deploy_ssh_key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        if: ${{ inputs.node_version != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Run setup command
+        if: ${{ inputs.setup_command != '' }}
+        run: ${{ inputs.setup_command }}
+
+      - name: Run install command
+        if: ${{ inputs.install_command != '' }}
+        run: ${{ inputs.install_command }}
+
+      - name: Run build command
+        if: ${{ inputs.build_command != '' }}
+        run: ${{ inputs.build_command }}
+
+      - name: Validate deploy source
+        run: |
+          if [ ! -d "${{ inputs.deploy_source }}" ]; then
+            echo "Deploy source directory '${{ inputs.deploy_source }}' does not exist." >&2
+            exit 1
+          fi
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.deploy_ssh_key }}
+
+      - name: Trust deploy host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ inputs.deploy_port }}" -H "${{ inputs.deploy_host }}" >> ~/.ssh/known_hosts
+
+      - name: Sync files to server
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            -e "ssh -p ${{ inputs.deploy_port }}" \
+            "${{ inputs.deploy_source }}/" \
+            "${{ inputs.deploy_user }}@${{ inputs.deploy_host }}:${{ inputs.deploy_path }}/"
