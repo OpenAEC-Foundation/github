@@ -21,7 +21,7 @@ on:
       deploy_source:
         required: false
         type: string
-        default: "."
+        default: ""
       checkout_sparse:
         required: false
         type: string
@@ -56,6 +56,11 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    outputs:
+      deploy_source: ${{ steps.resolve.outputs.deploy_source }}
+      site_hostname: ${{ steps.resolve.outputs.site_hostname }}
+      manage_nginx: ${{ steps.resolve.outputs.manage_nginx }}
+      cert_name: ${{ steps.resolve.outputs.cert_name }}
     steps:
       - name: Check out repository
         if: ${{ inputs.checkout_sparse == '' }}
@@ -86,10 +91,45 @@ jobs:
         if: ${{ inputs.build_command != '' }}
         run: ${{ inputs.build_command }}
 
+      - name: Resolve deploy layout
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOY_PATH="${{ inputs.deploy_path }}"
+          DEPLOY_SOURCE="${{ inputs.deploy_source }}"
+          DEPLOY_USER="${{ inputs.deploy_user }}"
+          SITE_HOSTNAME="$(basename "$DEPLOY_PATH")"
+          SITE_SLUG="${SITE_HOSTNAME%%.*}"
+          CERT_NAME="$(awk -F. '{ if (NF >= 2) print $(NF-1) "." $NF; else print $0 }' <<<"$SITE_HOSTNAME")"
+          MANAGE_NGINX="false"
+
+          if [ -z "$DEPLOY_SOURCE" ]; then
+            if [ -d "$SITE_SLUG" ]; then
+              DEPLOY_SOURCE="$SITE_SLUG"
+            else
+              DEPLOY_SOURCE="."
+            fi
+          fi
+
+          if [[ "$DEPLOY_PATH" == /var/www/* ]] && [[ "$SITE_HOSTNAME" == *.* ]] && [[ "$DEPLOY_USER" == "root" ]]; then
+            MANAGE_NGINX="true"
+          fi
+
+          echo "Resolved deploy source: $DEPLOY_SOURCE"
+          echo "Resolved site hostname: $SITE_HOSTNAME"
+          echo "Manage nginx site: $MANAGE_NGINX"
+
+          echo "deploy_source=$DEPLOY_SOURCE" >> "$GITHUB_OUTPUT"
+          echo "site_hostname=$SITE_HOSTNAME" >> "$GITHUB_OUTPUT"
+          echo "manage_nginx=$MANAGE_NGINX" >> "$GITHUB_OUTPUT"
+          echo "cert_name=$CERT_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Validate deploy source
         run: |
-          if [ ! -d "${{ inputs.deploy_source }}" ]; then
-            echo "Deploy source directory '${{ inputs.deploy_source }}' does not exist." >&2
+          if [ ! -d "${{ steps.resolve.outputs.deploy_source }}" ]; then
+            echo "Deploy source directory '${{ steps.resolve.outputs.deploy_source }}' does not exist." >&2
             exit 1
           fi
 
@@ -113,7 +153,7 @@ jobs:
 
           rsync -a \
             "${EXCLUDE_ARGS[@]}" \
-            "${{ inputs.deploy_source }}/" \
+            "${{ steps.resolve.outputs.deploy_source }}/" \
             "$STAGE_DIR/"
 
       - name: Upload deploy artifact
@@ -144,7 +184,58 @@ jobs:
 
       - name: Sync files to server
         run: |
+          ssh -p "${{ inputs.deploy_port }}" \
+            "${{ inputs.deploy_user }}@${{ inputs.deploy_host }}" \
+            "mkdir -p '${{ inputs.deploy_path }}'"
+
           rsync -az --delete \
             -e "ssh -p ${{ inputs.deploy_port }}" \
             "${{ runner.temp }}/site/" \
             "${{ inputs.deploy_user }}@${{ inputs.deploy_host }}:${{ inputs.deploy_path }}/"
+
+      - name: Ensure nginx site
+        if: ${{ needs.prepare.outputs.manage_nginx == 'true' }}
+        run: |
+          ssh -p "${{ inputs.deploy_port }}" "${{ inputs.deploy_user }}@${{ inputs.deploy_host }}" \
+            "SITE_HOSTNAME='${{ needs.prepare.outputs.site_hostname }}' DEPLOY_PATH='${{ inputs.deploy_path }}' CERT_NAME='${{ needs.prepare.outputs.cert_name }}' bash -s" <<'EOF'
+          set -euo pipefail
+
+          CONFIG_PATH="/etc/nginx/sites-available/$SITE_HOSTNAME"
+          LINK_PATH="/etc/nginx/sites-enabled/$SITE_HOSTNAME"
+          MANAGED_MARKER="# Managed by OpenAEC shared deploy workflow"
+
+          if [ -f "$CONFIG_PATH" ] && ! grep -Fq "$MANAGED_MARKER" "$CONFIG_PATH"; then
+            echo "Nginx config exists and is unmanaged, leaving it unchanged: $CONFIG_PATH"
+            exit 0
+          fi
+
+          printf '%s\n' \
+            "$MANAGED_MARKER" \
+            "server {" \
+            "    listen 80;" \
+            "    listen [::]:80;" \
+            "    server_name $SITE_HOSTNAME;" \
+            "    return 301 https://\$host\$request_uri;" \
+            "}" \
+            "" \
+            "server {" \
+            "    listen 443 ssl http2;" \
+            "    listen [::]:443 ssl http2;" \
+            "    server_name $SITE_HOSTNAME;" \
+            "" \
+            "    root $DEPLOY_PATH;" \
+            "    index index.html;" \
+            "" \
+            "    ssl_certificate /etc/letsencrypt/live/$CERT_NAME/fullchain.pem;" \
+            "    ssl_certificate_key /etc/letsencrypt/live/$CERT_NAME/privkey.pem;" \
+            "" \
+            "    location / {" \
+            "        try_files \$uri \$uri/ /index.html;" \
+            "    }" \
+            "}" \
+            > "$CONFIG_PATH"
+
+          ln -sfn "$CONFIG_PATH" "$LINK_PATH"
+          nginx -t
+          systemctl reload nginx
+          EOF
