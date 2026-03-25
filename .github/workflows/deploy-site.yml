@@ -106,7 +106,9 @@ jobs:
           MANAGE_NGINX="false"
 
           if [ -z "$DEPLOY_SOURCE" ]; then
-            if [ -d "$SITE_SLUG" ]; then
+            if [ -d "$SITE_SLUG/dist" ]; then
+              DEPLOY_SOURCE="$SITE_SLUG/dist"
+            elif [ -d "$SITE_SLUG" ]; then
               DEPLOY_SOURCE="$SITE_SLUG"
             else
               DEPLOY_SOURCE="."
